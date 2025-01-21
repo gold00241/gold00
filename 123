@@ -1,0 +1,354 @@
+import sqlite3
+import os
+import tkinter as tk
+from tkinter import messagebox
+
+# Функция для удаления старой базы данных (если существует)
+def delete_old_db():
+    if os.path.exists('example.db'):
+        os.remove('example.db')
+
+# Функция для создания базы данных и заполнения ее данными
+def create_db():
+    conn = sqlite3.connect('example.db')
+    cursor = conn.cursor()
+
+    # Создаем таблицы
+    cursor.execute('''CREATE TABLE IF NOT EXISTS customers (
+        customer_id INTEGER PRIMARY KEY,
+        name TEXT,
+        email TEXT
+    )''')
+
+    cursor.execute('''CREATE TABLE IF NOT EXISTS orders (
+        order_id INTEGER PRIMARY KEY,
+        order_date TEXT,
+        customer_id INTEGER,
+        FOREIGN KEY (customer_id) REFERENCES customers(customer_id)
+    )''')
+
+    cursor.execute('''CREATE TABLE IF NOT EXISTS products (
+        product_id INTEGER PRIMARY KEY,
+        name TEXT,
+        price REAL
+    )''')
+
+    cursor.execute('''CREATE TABLE IF NOT EXISTS order_products (
+        order_id INTEGER,
+        product_id INTEGER,
+        quantity INTEGER,
+        FOREIGN KEY (order_id) REFERENCES orders(order_id),
+        FOREIGN KEY (product_id) REFERENCES products(product_id),
+        PRIMARY KEY (order_id, product_id)
+    )''')
+
+    # Заполняем таблицы данными
+    cursor.executemany('''INSERT INTO customers (name, email) VALUES (?, ?)''', [
+        ('Alice', 'alice@example.com'),
+        ('Bob', 'bob@example.com'),
+        ('Charlie', 'charlie@example.com')
+    ])
+
+    cursor.executemany('''INSERT INTO orders (order_date, customer_id) VALUES (?, ?)''', [
+        ('2025-01-01', 1),
+        ('2025-01-02', 2),
+        ('2025-01-03', 3)
+    ])
+
+    cursor.executemany('''INSERT INTO products (name, price) VALUES (?, ?)''', [
+        ('Laptop', 1000.0),
+        ('Phone', 500.0),
+        ('Tablet', 300.0)
+    ])
+
+    cursor.executemany('''INSERT INTO order_products (order_id, product_id, quantity) VALUES (?, ?, ?)''', [
+        (1, 1, 1),
+        (1, 2, 2),
+        (2, 2, 1),
+        (3, 3, 3),
+        (3, 1, 1)
+    ])
+
+    conn.commit()
+    return conn
+
+# Функция для обработки строки фильтра
+def format_condition(filter_condition, table, conn):
+    if '=' in filter_condition:
+        column, value = filter_condition.split('=')
+        column = column.strip()
+        value = value.strip()
+
+        # Проверяем, существует ли столбец в таблице
+        cursor = conn.cursor()
+        cursor.execute(f"PRAGMA table_info({table})")  # Получаем информацию о столбцах таблицы
+        columns = [column_info[1] for column_info in cursor.fetchall()]
+
+        if column not in columns:
+            raise ValueError(f"Column '{column}' does not exist in table '{table}'")
+
+        # Получаем тип столбца
+        cursor.execute(f"PRAGMA table_info({table})")
+        column_type = None
+        for column_info in cursor.fetchall():
+            if column_info[1] == column:
+                column_type = column_info[2]
+                break
+        
+        # Проверяем тип данных и производим нужные преобразования
+        if column_type == 'TEXT':  # Столбец типа TEXT
+            if not value.startswith("'") and not value.endswith("'"):
+                value = f"'{value}'"
+        elif column_type == 'INTEGER' or column_type == 'REAL':  # Столбцы типа INTEGER или REAL
+            try:
+                value = float(value)  # Преобразуем в число
+            except ValueError:
+                raise ValueError(f"Invalid value: '{value}' for column '{column}', expected a number.")
+        elif column_type == 'BLOB':  # Столбец типа BLOB (можно добавить логику для этого типа, если нужно)
+            raise ValueError(f"Column '{column}' has type BLOB, which is not supported for filtering.")
+        
+        return f"{column} = {value}"
+    return filter_condition
+
+# Функция для проверки существования данных по фильтру
+def check_data_exists(conn, table, filter_condition):
+    cursor = conn.cursor()
+    cursor.execute(f"SELECT COUNT(*) FROM {table} WHERE {filter_condition}")
+    count = cursor.fetchone()[0]
+    return count > 0
+
+# Функция для обновления данных по условию
+def update_data(conn, table, filter_condition, new_values):
+    cursor = conn.cursor()
+
+    filter_condition = format_condition(filter_condition, table, conn)
+
+    if not check_data_exists(conn, table, filter_condition):
+        messagebox.showerror("Error", f"No data found matching condition: {filter_condition}")
+        return
+
+    # Обновление данных по всем столбцам без ограничений
+    set_clause = ', '.join([f"{column} = ?" for column in new_values.keys()])
+    values = list(new_values.values())
+
+    cursor.execute(f'''
+        UPDATE {table} SET {set_clause} WHERE {filter_condition}
+    ''', values)
+
+    conn.commit()
+    messagebox.showinfo("Success", f"Data updated in {table} table!")
+
+# Функция для удаления данных по фильтру из таблиц
+def delete_data(conn, filter_condition, table):
+    cursor = conn.cursor()
+
+    try:
+        # Обрабатываем фильтр для правильного формата
+        filter_condition = format_condition(filter_condition, table, conn)
+
+        if not check_data_exists(conn, table, filter_condition):
+            raise ValueError(f"No data found matching condition: {filter_condition}")
+
+        # Сначала удалим связанные записи из дочерних таблиц
+        if table == 'customers':
+            cursor.execute(f"DELETE FROM order_products WHERE order_id IN (SELECT order_id FROM orders WHERE customer_id IN (SELECT customer_id FROM customers WHERE {filter_condition}))")
+            cursor.execute(f"DELETE FROM orders WHERE customer_id IN (SELECT customer_id FROM customers WHERE {filter_condition})")
+        elif table == 'orders':
+            cursor.execute(f"DELETE FROM order_products WHERE order_id IN (SELECT order_id FROM orders WHERE {filter_condition})")
+        elif table == 'products':
+            cursor.execute(f"DELETE FROM order_products WHERE product_id IN (SELECT product_id FROM products WHERE {filter_condition})")
+
+        # Удаление данных из основной таблицы
+        cursor.execute(f"DELETE FROM {table} WHERE {filter_condition}")
+
+        conn.commit()
+        messagebox.showinfo("Success", f"Data deleted from {table} table!")
+    except sqlite3.OperationalError as e:
+        conn.rollback()  # Откатываем транзакцию в случае ошибки
+        messagebox.showerror("Error", f"Error occurred: {str(e)}")
+    except ValueError as ve:
+        conn.rollback()  # Откатываем транзакцию в случае ошибки
+        messagebox.showerror("Error", str(ve))
+
+# Функция для начала транзакции
+def begin_transaction():
+    global conn
+    conn.isolation_level = None  # Отключаем авто-commit
+    conn.execute("BEGIN TRANSACTION;")
+    messagebox.showinfo("Transaction", "Transaction started!")
+
+# Функция для завершения транзакции
+def end_transaction():
+    global conn
+    try:
+        conn.commit()  # Применяем изменения
+        messagebox.showinfo("Transaction", "Transaction committed successfully!")
+    except Exception as e:
+        conn.rollback()  # Откатываем изменения в случае ошибки
+        messagebox.showerror("Transaction", f"Transaction failed, rolled back! Error: {e}")
+    finally:
+        conn.isolation_level = 'DEFERRED'  # Возвращаем нормальный режим работы с БД
+
+# Создаем окно и интерфейс
+def create_gui():
+    # Удаляем старую базу данных (если существует)
+    delete_old_db()
+
+    # Создание главного окна
+    window = tk.Tk()
+    window.title("Database Viewer")
+
+    # Создание Listbox для отображения данных
+    listbox = tk.Listbox(window, width=100, height=20)
+    listbox.pack(padx=10, pady=10)
+
+    # Поля для ввода данных для вставки
+    insert_frame = tk.Frame(window)
+    insert_frame.pack(pady=10)
+
+    # Выпадающий список для выбора таблицы
+    table_options = ['customers', 'orders', 'products', 'order_products']
+    table_var = tk.StringVar(window)
+    table_var.set(table_options[0])  # по умолчанию выбираем 'customers'
+    table_dropdown = tk.OptionMenu(insert_frame, table_var, *table_options)
+    table_dropdown.grid(row=0, column=0, padx=10)
+
+    # Кнопка для загрузки данных
+    load_button = tk.Button(window, text="Load Data", command=lambda: read_data(conn, listbox, table_var.get()))
+    load_button.pack(pady=10)
+
+    # Кнопка для начала транзакции
+    begin_transaction_button = tk.Button(window, text="Begin Transaction", command=begin_transaction)
+    begin_transaction_button.pack(pady=5)
+
+    # Кнопка для завершения транзакции
+    end_transaction_button = tk.Button(window, text="End Transaction", command=end_transaction)
+    end_transaction_button.pack(pady=5)
+
+    # Вводимые данные для вставки
+    fields = []
+
+    # Обновление полей ввода в зависимости от выбранной таблицы
+    def update_fields(*args):
+        # Очистить старые поля
+        for field in fields:
+            field.grid_forget()
+        fields.clear()
+
+        selected_table = table_var.get()
+
+        if selected_table == 'customers':
+            fields.append(tk.Entry(insert_frame))
+            fields[0].grid(row=1, column=1)
+            fields[0].insert(0, "name")
+            fields.append(tk.Entry(insert_frame))
+            fields[1].grid(row=2, column=1)
+            fields[1].insert(0, "email")
+        elif selected_table == 'orders':
+            fields.append(tk.Entry(insert_frame))
+            fields[0].grid(row=1, column=1)
+            fields[0].insert(0, "order_date")
+            fields.append(tk.Entry(insert_frame))
+            fields[1].grid(row=2, column=1)
+            fields[1].insert(0, "customer_id")
+        elif selected_table == 'products':
+            fields.append(tk.Entry(insert_frame))
+            fields[0].grid(row=1, column=1)
+            fields[0].insert(0, "name")
+            fields.append(tk.Entry(insert_frame))
+            fields[1].grid(row=2, column=1)
+            fields[1].insert(0, "price")
+        elif selected_table == 'order_products':
+            fields.append(tk.Entry(insert_frame))
+            fields[0].grid(row=1, column=1)
+            fields[0].insert(0, "order_id")
+            fields.append(tk.Entry(insert_frame))
+            fields[1].grid(row=2, column=1)
+            fields[1].insert(0, "product_id")
+            fields.append(tk.Entry(insert_frame))
+            fields[2].grid(row=3, column=1)
+            fields[2].insert(0, "quantity")
+
+    # Обновляем поля при изменении выбранной таблицы
+    table_var.trace('w', update_fields)
+
+    # Кнопка для вставки данных
+    def insert_button_click():
+        table = table_var.get()
+        data = [field.get() for field in fields]
+        insert_data(conn, table, data)
+
+    insert_button = tk.Button(window, text="Insert Data", command=insert_button_click)
+    insert_button.pack(pady=10)
+
+    # Поля для обновления данных по фильтру
+    filter_label = tk.Label(window, text="Filter condition (e.g., 'customer_id = 1'):")
+    filter_label.pack(pady=5)
+
+    filter_condition_entry = tk.Entry(window)
+    filter_condition_entry.pack(pady=5)
+
+    # Поля для ввода обновляемых данных
+    update_fields_label = tk.Label(window, text="Enter new values (column_name = new_value):")
+    update_fields_label.pack(pady=5)
+
+    update_values_entry = tk.Entry(window)
+    update_values_entry.pack(pady=5)
+
+    update_button = tk.Button(window, text="Update Data", command=lambda: update_button_click(filter_condition_entry.get(), update_values_entry.get()))
+    update_button.pack(pady=10)
+
+    def update_button_click(filter_condition, new_values_str):
+        new_values = {}
+        for item in new_values_str.split(','):
+            column, value = item.split('=')
+            new_values[column.strip()] = value.strip()
+        table = table_var.get()
+        update_data(conn, table, filter_condition, new_values)
+
+    # Кнопка для удаления данных
+    delete_button = tk.Button(window, text="Delete Data", command=lambda: delete_button_click(filter_condition_entry.get(), table_var.get()))
+    delete_button.pack(pady=10)
+
+    def delete_button_click(filter_condition, table):
+        if not filter_condition:
+            messagebox.showerror("Error", "Please enter a valid filter condition!")
+            return
+        try:
+            delete_data(conn, filter_condition, table)
+        except Exception as e:
+            messagebox.showerror("Error", f"Error: {e}")
+
+    # Создаем подключение к базе данных
+    global conn
+    conn = create_db()
+
+    # Запуск главного цикла
+    window.mainloop()
+
+def read_data(conn, listbox, table):
+    cursor = conn.cursor()
+    cursor.execute(f"SELECT * FROM {table}")
+    rows = cursor.fetchall()
+
+    listbox.delete(0, tk.END)
+    for row in rows:
+        listbox.insert(tk.END, row)
+
+def insert_data(conn, table, data):
+    cursor = conn.cursor()
+
+    if table == 'customers':
+        cursor.execute("INSERT INTO customers (name, email) VALUES (?, ?)", (data[0], data[1]))
+    elif table == 'orders':
+        cursor.execute("INSERT INTO orders (order_date, customer_id) VALUES (?, ?)", (data[0], data[1]))
+    elif table == 'products':
+        cursor.execute("INSERT INTO products (name, price) VALUES (?, ?)", (data[0], data[1]))
+    elif table == 'order_products':
+        cursor.execute("INSERT INTO order_products (order_id, product_id, quantity) VALUES (?, ?, ?)", (data[0], data[1], data[2]))
+
+    conn.commit()
+    messagebox.showinfo("Success", "Data inserted successfully!")
+
+if __name__ == '__main__':
+    create_gui()
